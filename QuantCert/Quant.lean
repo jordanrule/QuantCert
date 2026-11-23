@@ -2,12 +2,13 @@ import Std
 
 namespace QuantCert
 
-/-- Positive rational scale and nonempty, signed two's-complement storage. -/
+/-- Positive rational scale and nonempty storage; signed by default. -/
 structure QuantParams where
   bitWidth : Nat
   width_pos : 0 < bitWidth
   scale : Rat
   scale_pos : 0 < scale
+  signed : Bool := true
 
 abbrev QType := QuantParams
 
@@ -16,7 +17,7 @@ def quantize (q : QType) (x : Rat) : BitVec q.bitWidth :=
   BitVec.ofInt q.bitWidth ((x / q.scale + (1 : Rat) / 2).floor)
 
 def dequantize (q : QType) (x : BitVec q.bitWidth) : Rat :=
-  (x.toInt : Rat) * q.scale
+  ((if q.signed then x.toInt else (x.toNat : Int)) : Rat) * q.scale
 
 /-- Exact, unbounded dot product used by the range certificate. -/
 def dotProduct : List (Int × Int) → Int

@@ -2,9 +2,9 @@ import QuantCert.Semantics
 
 namespace QuantCert.Examples
 
-def int8 : QType := ⟨8, by decide, (1 : Rat) / 128, by decide +kernel⟩
-def accumulator : QType := ⟨32, by decide, (1 : Rat) / 16384, by decide +kernel⟩
-def output8 : QType := ⟨8, by decide, (1 : Rat) / 32, by decide +kernel⟩
+def int8 : QType := ⟨8, by decide, (1 : Rat) / 128, by decide +kernel, true⟩
+def accumulator : QType := ⟨32, by decide, (1 : Rat) / 16384, by decide +kernel, true⟩
+def output8 : QType := ⟨8, by decide, (1 : Rat) / 32, by decide +kernel, true⟩
 
 abbrev Pair8 := WireType.word int8 ⊗ WireType.word int8
 
@@ -107,7 +107,5 @@ theorem layer_exact (x y z t : BitVec 8) :
 /-- A gate-level fanout example; duplication is wiring, not a hidden gate. -/
 def gateDemo : Circuit (.word bitQ ⊗ .word bitQ) (.word bitQ ⊗ .word bitQ) :=
   Circuit.prim Prim.nand &&& Circuit.fst
-
-#eval IO.print (toVerilog "quantized_layer" quantizedLayer)
 
 end QuantCert.Examples

@@ -14,9 +14,17 @@ QuantCert is a small example of attaching **mathematical receipts** to the
 arithmetic and compilation steps before sending RTL into a chip implementation
 flow. Engineers can justify register widths, track the real value represented
 by each integer, bound rounding error, and establish that a structural compiler
-preserves a circuit's behavior. An independent Yosys equivalence check also
-checks the generated example's Verilog across **all input bit patterns**, rather
-than a collection of test vectors.
+preserves a circuit's behavior. The **fixed-weight model frontend** represents
+shape-typed affine/ReLU networks, quantizes their parameters, checks intermediate
+widths, and bounds end-to-end error against a rational reference model. It lowers
+to the **same `Circuit` AST, compiler, netlist, and Verilog emitter** as directly
+written circuits. One verification command builds the proofs and checks both
+examples' generated RTL against independent specifications across **all input
+bit patterns**, rather than a collection of test vectors:
+
+```sh
+bash scripts/verify.sh
+```
 
 This is a building block for tape-out assurance, **not tape-out sign-off**.
 It does not verify model accuracy, timing closure, clocks, reset, CDC, memories,
@@ -40,6 +48,10 @@ cycle-level scheduling or register insertion.
                      |
               one INT8 output
 
+  Fixed-weight QuantNetwork --lower--> typed Circuit AST
+                                          ^
+  Directly written circuits --------------+
+
   typed Circuit AST --fresh-wire compiler--> flat structural Netlist
           |                                        |
       evalCircuit                              evalNetlist
@@ -54,14 +66,16 @@ cycle-level scheduling or register insertion.
 bundles in sequence; `***` puts circuits in parallel; `&&&` duplicates an input
 bundle and sends it to two circuits. Products, swaps, duplication, dropping,
 projections, associators, and unitors are structural wiring, not hidden cells.
-NAND supports gate-level circuits; signed multiply, add, requantization, and
-ReLU support word-level circuits. `qMatMul n` constructs one row with `n + 1`
+NAND supports gate-level circuits; multiply, add, requantization, ReLU,
+constants, zero-point subtraction/resizing, shifts, and clamping support
+word-level circuits. `qMatMul n` constructs one row with `n + 1`
 variable activation/weight pairs; the demo chooses two terms. Multiple rows can
 be built with fanout and parallel composition.
 
-`QType` is `QuantParams`: a strictly positive bit width and rational scale with
-a positivity proof. Composition checks the whole wire type, including its
-scale. Multiplication carries a product-scale equality. Requantization carries
+`QType` is `QuantParams`: a strictly positive bit width, a positive rational
+scale, and signed/unsigned interpretation (signed by default). Composition checks
+the whole wire type, including its scale and signedness. Multiplication carries
+a product-scale equality. Requantization carries
 `RequantParams`, including a checked approximation receipt for the actual ratio
 of the input and output scales. No `mathlib`, external Lake packages, real-number
 library, or floating-point calculation is required.
@@ -86,6 +100,13 @@ standard-library lemmas, `omega`, and `grind`.
 | `requantParams_stored_approx` | The error bound transfers to a narrowed bit-vector output when its signed range hypotheses hold. |
 | `compile_correct` | Running the flat compiled assignments produces exactly `evalCircuit`, for every circuit, initial store, and typed input reference bundle below the fresh-wire counter. |
 | `qMatMul_exact`, `layer_narrowing_safe`, `layer_exact` | The actual two-term demo never wraps in its products, accumulator, or INT8 narrowing, and implements the exact rounded-and-ReLU integer formula for every input. |
+| `Model.Format.encode_error` | Saturating input encoding has at most half an LSB error on the explicitly stated representable real domain. |
+| `Model.QuantNetwork.outputRange_sound` | Automatically propagated integer intervals enclose every network output for every input in the supplied code box. |
+| `Model.QuantNetwork.machineEval_exact` | A checked `Safe` certificate makes execution with bit-vector storage at every specified arithmetic intermediate equal to unbounded integer execution. |
+| `Model.QuantNetwork.encodedError_sound` | Input encoding and finite-width network execution differ from the rational reference by at most the automatically composed per-output error budget. |
+| `Model.QuantNetwork.lower_correct` | Lowering any quantized network to `Circuit` preserves its finite-width semantics for every input bit pattern, even when widths wrap. |
+| `Model.QuantNetwork.compile_correct`, `compiledError_sound` | The shared netlist compiler preserves network behavior and carries the model error bound through to operational netlist outputs. |
+| `Model.Examples.classifier_compiled_error` | The compiled two-layer scalar-output example has absolute real-value output error at most `1/3` throughout the real input box `[-1,1]^2`, given correctly encoded input wires. |
 
 For the requantization theorem, `realScale = num / den`, `den > 0`,
 `D = 2^shift`, and `deltaScale = delta / den`. The exact approximation hypothesis
@@ -105,12 +126,15 @@ output is in `[0,64]`. The generic accumulator certificate applies to prefixes
 as well, so a checked row length bounds its partial sums. Larger rows require
 their own capacity receipt; their construction alone does not prove safety.
 
-### Semantic and verification boundaries
+### Shared RTL semantics and verification boundaries
 
-Wire values are `BitVec`s. Arithmetic primitives wrap on storage; **they do
-not saturate**. `quantize` rounds a rational value and wraps to the requested
-width; `dequantize` reads a signed integer and multiplies by its scale. The
-error theorem for unbounded integer requantization does not by itself justify
+All frontend paths use `Circuit` wire values represented as `BitVec`s.
+Arithmetic primitives wrap on storage; **saturation is an explicit `clip`
+operation**, not an implicit property of multiplication or narrowing. The
+low-level `quantize` rounds a rational value and wraps to the requested width;
+`dequantize` reads according to the wire's signedness and multiplies by its scale.
+The model frontend instead inserts explicit zero-point and clamping operations.
+The error theorem for unbounded integer requantization does not by itself justify
 arbitrary narrowing: use the stored-output theorem and prove its range
 hypotheses, as the example does.
 
@@ -120,17 +144,200 @@ Typed input/output environments are trees of `WireId`s; the cell list is flat.
 Cells are stored in reverse topological order and evaluated/printed in
 topological order. The compiler invariant proves fresh output allocation,
 counter monotonicity, preservation of existing wires, and semantic agreement.
-Requantization RTL uses an explicitly widened signed product/rounding temporary
-so the expression cannot overflow before its arithmetic shift.
+The shared printer explicitly sign-extends or zero-extends inputs before
+multiplication and zero-point arithmetic. The low-level requantization primitive
+uses a widened product/rounding temporary. Model lowering instead exposes its
+specified accumulator and temporary widths as ordinary arithmetic cells, so the
+same wrapping points used in its proofs appear in RTL.
 
 `compile_correct` is a general Lean proof about the **structural netlist
 semantics**, whose primitive meaning is shared with the DSL. It is not a
-Lean proof of the Verilog parser, printer, or Yosys. The separate Yosys run checks
-the emitted two-term example against `scripts/reference.sv`, an independently
-written signed-arithmetic specification. Its eight output bits are proven
-equivalent for all four INT8 inputs (32 input bits), and the design is
-synthesized and checked for structural problems. This does not certify every
-possible circuit's printed Verilog.
+Lean proof of the Verilog parser, printer, or Yosys. The Yosys run checks the
+two-product circuit, the lowered two-layer network, and a primitive regression
+module against independently written specifications in `scripts/reference.sv`.
+Every module is synthesized and checked for structural problems. These
+instance-level checks do not certify every possible circuit's printed Verilog.
+
+## Fixed-weight model and quantization proofs
+
+The model is a frontend to the shared combinational RTL DSL, not a second
+backend or a separate model-only execution path:
+
+```text
+Fixed rational weights + biases + affine/ReLU network + rational input box
+             |                              |
+        Layer.quantize                 Network.eval
+             |                         ideal rational output
+     QuantNetwork + integer ranges          |
+             |                              |
+       lower_correct                        |
+             v                              |
+     Circuit -> compile -> Netlist          |
+             |                              |
+     decode netlist outputs ----------------+-- per-output real error bound
+             |
+       shared toVerilog
+             |
+   Yosys equivalence + synthesis
+```
+
+`Model.Layer n m` stores fixed rational weights and biases and an identity or
+ReLU activation. Tensors are functions on `Fin n`/`Fin m`, so incompatible
+dimensions cannot be composed and dot products cannot silently truncate.
+`Model.Network` composes layers of arbitrary dimensions. Its interpretation is
+exact rational arithmetic, **not FP32 execution or an imported trained model**.
+
+### Explicit deployment arithmetic
+
+`Model.Format` specifies a positive width, signed or unsigned storage, a positive
+rational scale, and an in-range zero point. Its real interpretation is
+`(code - zeroPoint) * scale`. `Format.encode` rounds to nearest with ties toward
+positive infinity and **saturates**, unlike the old DSL's wrapping `quantize`.
+Both negative ties and signed/unsigned endpoints are covered by regressions.
+There is no TensorFlow Lite, ONNX, or other framework-compatibility claim.
+
+`Layer.quantize` constructs a quantized layer from the supplied reference:
+
+- Activations have a uniform format at each layer boundary; weight formats,
+  including scales and zero points, are per output channel.
+- Weights are encoded with rounding and saturation. Bias is rounded at scale
+  `input.scale * weightFormat[channel].scale`, with zero point zero. Bias is not
+  silently clipped: insufficient accumulator capacity rejects the certificate.
+- A caller chooses each channel's shift. The multiplier is rounded from the
+  exact scale ratio times `2^shift`. Analysis measures its actual discrepancy;
+  it does not assume the ratio is exactly representable.
+- Integer execution accumulates centered products, adds bias, computes
+  `(acc * multiplier + floor(2^shift / 2)) / 2^shift`, applies the activation,
+  adds the output zero point, and saturates to the output storage range.
+
+Different layers may have different activation formats, but a quantized network
+boundary must match exactly. Per-channel **activation** scales, convolutions,
+nonlinear activations other than ReLU, and framework import are not implemented.
+
+### Automatically checked width certificates
+
+`QuantLayer.productRange`, `accRange`, `mulRange`, `tempRange`, `roundRange`,
+`preClampRange`, and `outputRange` compute inclusive integer intervals from an
+input code box and the actual fixed weights. Negative coefficients and
+zero-point subtraction are included. `QuantNetwork.outputRange` propagates these
+intervals through every layer.
+
+`QuantLayer.Safe` checks centered operand widths, each product, the bias, every
+suffix sum in the specified right-associated dot product, the final bias
+addition, the multiplier, the rounding constant, the widened multiplication
+and rounding addition, the shifted value, and the zero-point addition.
+`QuantNetwork.Safe` checks this recursively using each preceding layer's output
+ranges. The input ranges must also be ordered and lie inside their format.
+For a concrete model, `by decide +kernel` constructs the certificate without
+hand-written arithmetic proofs. `decide (net.Safe ranges)` provides an
+executable yes/no check; individual ranges and `IntRange.fits` locate rejected
+widths.
+
+`machineEval_exact` connects these checks to an explicit finite-width
+interpreter: centered operands and products are stored at accumulator width,
+every dot-product addition and bias are stored, requantization operations are
+stored at temporary width, and saturated outputs are stored/read using their
+signed or unsigned format. Centered subtractions must be widened before
+multiplication. The proof covers this accumulation order, **not arbitrary
+reassociation or a different implementation**. Certificate rejection means
+“not certified”; interval overapproximation is not an overflow counterexample.
+Safety is conditional on the declared input box, not merely observed
+calibration minima/maxima.
+
+### Compositional error budgets
+
+`QuantLayer.outputError` and `QuantNetwork.outputError` compute bounds in
+**real-value units**, per output channel. The layer budget is:
+
+```text
+|decodedBias - idealBias|
++ sum_i (|idealWeight_i| * inputError_i
+         + |decodedWeight_i - idealWeight_i| * decodedInputMagnitude_i)
++ outputScale
++ accumulatorMagnitude * |outputScale * multiplier / 2^shift - accumulatorScale|
++ outputScale * worstClippingDistanceInCodes
+```
+
+Input encoding contributes half an input LSB when the real input is within its
+format's representable interval. The requantization rounding allowance is a
+conservative **one output LSB**; shift zero is supported too. Weight/bias
+mismatch, multiplier approximation, rounding, and output clipping are all
+accounted for. ReLU is proved nonexpansive, so these bounds compose without
+adding an activation-error term. Output clipping is included even when it is
+intentional; it is not confused with an unsafe intermediate wrap.
+
+`encodedError_sound` connects rational input encoding, finite-width execution,
+and the rational reference in one theorem, with explicit input-domain and
+`Safe` hypotheses. `outputError_sound` also accepts an externally supplied
+input-error bound, for integration with another input encoder. Bounds can be
+loose: this is interval/magnitude analysis, not a correlation-aware neural
+network verifier. It does not prove classification accuracy, robustness,
+decision preservation, or equivalence to a floating-point runtime.
+
+### One lowering and compilation pipeline
+
+`QuantNetwork.lower` expands a network into ordinary `Circuit` composition,
+fanout, projections, constants, multiplication, addition, shifts, ReLU, offsets,
+and clips. It does **not** embed an opaque model cell or invoke a model-specific
+Verilog printer. `QuantLayer.productCircuit`, `accCircuit`, `roundCircuit`, and
+`neuronCircuit` expose the lowering for inspection.
+Internal arithmetic wires use scale-one raw integer types; the model's scale
+receipts establish their real interpretation. Boundary wires retain their
+format's width, scale, and signedness, while zero points become explicit
+arithmetic rather than implicit wire metadata.
+
+`lower_correct` connects this expansion to the finite-width reference
+interpreter for every input bit pattern; no `Safe` premise is needed just to
+preserve wrapping behavior. `QuantNetwork.compile_correct` then applies the
+existing generic `compile_correct` theorem. `compiledError_sound` combines this
+with range and error receipts for the rational reference model.
+`machineEval` remains an executable reference semantics used in these proofs,
+not an alternative compilation or RTL path.
+
+The public hardware interface is integer codes: **rational input encoding is a
+host-side operation**, not generated hardware. Unsigned ports retain their
+actual width and unsigned declarations; centering explicitly widens them before
+subtracting zero points. The compiled error theorem assumes the input wires
+contain the specified encoded inputs.
+
+### Worked two-layer model
+
+`QuantCert/Examples/CertifiedModel.lean` defines a fixed `2 -> 2 -> 1` network
+with a hidden ReLU, unsigned activation storage, signed output storage, nonzero
+zero points, and two different weight formats in the first layer. Its weights
+and biases include values that quantization cannot represent exactly; the
+second layer also has nonzero multiplier approximation error.
+
+For **every rational input in `[-1,1]^2`**, the example proves that the stored
+implementation has absolute output error at most **`1/3`** against its rational
+reference. Its encoded input box is `[112,144]^2`, and its final output codes
+are in `[-7,4]`. The certificate rejects separate variants with an 8-bit
+accumulator or an 8-bit requantization temporary.
+The first layer also has a certified 9-bit accumulator / 12-bit temporary
+variant. An 11-bit temporary fits its multiplication but fails the subsequent
+rounding addition: that temporary's interval reaches `1032`, above signed
+11-bit maximum `1023`.
+
+To inspect or adapt the example in a Lean file:
+
+```lean
+import QuantCert.ModelTests
+open QuantCert.Model QuantCert.Model.Examples
+
+#eval decide (classifier.Safe inputBox)
+#eval first.accRange inputBox 1
+#eval classifier.outputRange inputBox 0
+#eval classifier.outputError inputBox (fun _ => input8.scale * ((1 : Rat) / 2)) 0
+#check classifier_compiled_error
+#eval QuantCert.toVerilog "my_model" classifier.lower
+```
+
+`classifier_compiled_error` carries the `1/3` error receipt through to the
+shared compiled netlist. `classifier_full_codes_safe` additionally proves
+intermediate safety over the complete unsigned input code domain `[0,255]^2`.
+The emitted `certified_model` is independently checked by Yosys on **all 65,536
+input combinations**, without constraining the check to the smaller input box.
+The `1/3` model-error guarantee still applies only on `[-1,1]^2`.
 
 ## Build and print Verilog
 
@@ -140,14 +347,19 @@ toolchain if necessary; there are **zero external Lean dependencies**.
 
 ```sh
 lake build
-lake env lean QuantCert/Examples/QuantizedLayer.lean
 mkdir -p build
-.lake/build/bin/emit > build/quantized_layer.v
+.lake/build/bin/emit > build/designs.v
 ```
 
-Both the example's `#eval IO.print` and the `emit` executable print plain
-synthesizable Verilog, without quoted string escapes. The example module has
-four signed INT8 inputs `w0` through `w3` and one signed INT8 output `out0`.
+`Main.lean` is the single emission entry point. The executable and
+`lake env lean --run Main.lean` print the same plain synthesizable Verilog:
+
+| Module in `build/designs.v` | Interface |
+|---|---|
+| `quantized_layer` | Four signed INT8 inputs `w0` through `w3`, one signed INT8 output `out0` |
+| `certified_model` | Two unsigned INT8 inputs `w0`, `w1`, one signed INT8 output `out0` |
+| `primitive_regressions` | Signed/unsigned arithmetic, narrow wrapping, saturation, large shifts, and a lowered bias-only layer |
+
 Pass a legal, non-keyword Verilog module name to `toVerilog`;
 `toVerilogChecked` additionally checks identifier spelling.
 Warnings are treated as errors in the Lake configuration.
@@ -163,9 +375,14 @@ bash scripts/verify.sh
 
 The script fails on any build, proof-audit, output-comparison, equivalence, or
 structural-check failure. It builds every module and the edge-case regression
-checks, executes the example, audits theorem axioms, emits the RTL, compares
-both emission paths byte-for-byte, runs `equiv_simple` / `equiv_status -assert`,
-and synthesizes the generated design with `check -assert`.
+checks (including model lowering, signed/unsigned formats, and width rejection),
+audits arithmetic, compiler, lowering, and model theorem axioms, emits every
+module through `Main.lean`, and compares interpreted and compiled execution of
+that same emitter byte-for-byte. It runs `equiv_simple` /
+`equiv_status -assert` for each module against its independent RTL reference,
+then synthesizes each generated module with `check -assert`. Adding a different
+model requires its own reference/equivalence check; the supplied RTL checks
+cover the emitted examples, not arbitrary future models.
 
 To rerun just the RTL check after emission:
 
@@ -173,14 +390,11 @@ To rerun just the RTL check after emission:
 yosys -Q -T -l build/yosys.log scripts/verify.ys
 ```
 
-**Verified run:** Lean 4.24.0 and Yosys 0.69+post on macOS. `lake build`
-and the example completed with zero errors and zero warnings. Yosys reported
-`8 are proven and 0 are unproven`, `Equivalence successfully proven!`, and
-`Found and reported 0 problems.` The check is combinational: no assumptions,
+The checks are combinational: no assumptions,
 bounded cycle count, or stimulus file constrain the input space.
 
 Generated artifacts are ignored by Git:
-`build/quantized_layer.v`, `build/example-output.txt`, `build/axioms.txt`, and
+`build/designs.v`, `build/example-output.txt`, `build/axioms.txt`, and
 `build/yosys.log`. The axiom audit permits Lean's standard logical axioms and
 rejects `sorryAx` and native-evaluation proof axioms.
 
@@ -194,5 +408,13 @@ rejects `sorryAx` and native-evaluation proof axioms.
 | `QuantCert/Semantics.lean` | Operational netlist evaluation and compiler proof |
 | `QuantCert/Examples/QuantizedLayer.lean` | Quantized row demo and its end-to-end receipts |
 | `QuantCert/Tests.lean` | Signed extremes, rounding ties, gate and wiring regression checks |
+| `QuantCert/Model.lean` | Shape-typed rational and quantized affine/ReLU networks, signed/unsigned affine formats, parameter quantization |
+| `QuantCert/ModelRange.lean` | Executable interval propagation, width certificates, finite-width interpreter and exactness proof |
+| `QuantCert/ModelError.lean` | Input-encoding error, parameter/multiplier/rounding/clipping error, compositional network theorem |
+| `QuantCert/ModelLowering.lean` | Model-to-`Circuit` lowering, generic lowering/netlist correctness, compiled error preservation |
+| `QuantCert/Examples/CertifiedModel.lean` | Fixed two-layer model, checked widths, real-input error guarantee, rejected narrow variants |
+| `QuantCert/ModelTests.lean` | Affine-format endpoints/ties, per-channel parameters, nonzero error sources, network regression checks |
+| `QuantCert/RTLTests.lean` | Lowering regressions and shared-backend RTL edge-case circuit |
+| `Main.lean` | Single RTL emission entry point for all checked designs |
 | `scripts/Audit.lean` | Certificate axiom audit |
 | `scripts/reference.sv`, `scripts/verify.ys`, `scripts/verify.sh` | Independent RTL reference and reproducible Yosys verification |

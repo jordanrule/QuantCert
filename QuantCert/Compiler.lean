@@ -66,7 +66,8 @@ def Bounded : {a : WireType} → WireEnv a → Nat → Prop
 
 def wireName (i : WireId) : String := s!"w{i}"
 
-def signedDecl (q : QType) : String := s!"signed [{q.bitWidth - 1}:0]"
+def signedDecl (q : QType) : String :=
+  (if q.signed then "signed " else "") ++ s!"[{q.bitWidth - 1}:0]"
 
 /-- Allocate the module's leaf input ports before allocating internal cells. -/
 def inputEnv : (a : WireType) → Nat → WireEnv a × Nat × List (WireId × QType)
@@ -85,11 +86,13 @@ def outputLeaves : (a : WireType) → WireEnv a → List (WireId × QType)
 def intLiteral (width : Nat) (x : Int) : String :=
   if x < 0 then s!"(-{width}'sd{x.natAbs})" else s!"{width}'sd{x.natAbs}"
 
-/-- Explicit sign extension prevents Verilog expression sizing from truncating products. -/
+/-- Extend before arithmetic; unsigned words get a leading zero and a signed cast. -/
 def extend (q : QType) (width : Nat) (i : WireId) : String :=
   if width ≤ q.bitWidth then s!"$signed({wireName i})"
-  else "$signed({{" ++ toString (width - q.bitWidth) ++ "{" ++
-    wireName i ++ "[" ++ toString (q.bitWidth - 1) ++ "]}}, " ++ wireName i ++ "})"
+  else
+    let bit := if q.signed then wireName i ++ "[" ++ toString (q.bitWidth - 1) ++ "]"
+      else "1'b0"
+    "$signed({{" ++ toString (width - q.bitWidth) ++ "{" ++ bit ++ "}}, " ++ wireName i ++ "})"
 
 def primRTL {a : WireType} {q : QType} (op : Prim a q) (inputs : WireEnv a)
     (output : WireId) : List String :=
@@ -98,12 +101,14 @@ def primRTL {a : WireType} {q : QType} (op : Prim a q) (inputs : WireEnv a)
   match op, inputs with
   | .nand, (x, y) => [decl, s!"  assign {dst} = ~({wireName x} & {wireName y});"]
   | .mul a b out _, (x, y) =>
-      let w := max out.bitWidth (a.bitWidth + b.bitWidth)
+      let w := max out.bitWidth (a.bitWidth + b.bitWidth + 1)
       [decl, s!"  assign {dst} = {extend a w x} * {extend b w y};"]
   | .add _, (x, y) =>
       [decl, s!"  assign {dst} = $signed({wireName x}) + $signed({wireName y});"]
-  | .relu _, x =>
-      [decl, s!"  assign {dst} = $signed({wireName x}) < 0 ? '0 : {wireName x};"]
+  | .relu q, x =>
+      if q.signed then
+        [decl, s!"  assign {dst} = $signed({wireName x}) < 0 ? '0 : {wireName x};"]
+      else [decl, s!"  assign {dst} = {wireName x};"]
   | .requant a _ receipt, x =>
       let M := receipt.multiplier
       let shift := receipt.shift
@@ -112,6 +117,20 @@ def primRTL {a : WireType} {q : QType} (op : Prim a q) (inputs : WireEnv a)
       [decl, s!"  wire signed [{w - 1}:0] {tmp};",
        s!"  assign {tmp} = {extend a w x} * {intLiteral w M} + {intLiteral w ((2 ^ shift : Nat) / 2)};",
        s!"  assign {dst} = $signed({tmp}) >>> {shift};"]
+  | .const q value, _ => [decl, s!"  assign {dst} = {intLiteral q.bitWidth value};"]
+  | .offset a out zeroPoint, x =>
+      -- Widen before subtracting, including unsigned input codes and a negative zero point.
+      let w := max (a.bitWidth + 1) out.bitWidth + zeroPoint.natAbs.log2 + 2
+      let src := extend a w x
+      [decl, s!"  assign {dst} = {src} - {intLiteral w zeroPoint};"]
+  | .shift q amount, x =>
+      let cast := if q.signed then "$signed" else "$unsigned"
+      [decl, s!"  assign {dst} = {cast}({wireName x}) >>> {amount};"]
+  | .clip a _ lo hi, x =>
+      let w := max (a.bitWidth + 1) (max lo.natAbs.log2 hi.natAbs.log2 + 2)
+      let src := extend a w x
+      [decl, s!"  assign {dst} = {src} < {intLiteral w lo} ? {intLiteral w lo} :",
+       s!"    ({src} > {intLiteral w hi} ? {intLiteral w hi} : {src});"]
 
 def cellRTL (c : Cell) : List String := primRTL c.op c.inputs c.output
 

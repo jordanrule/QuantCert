@@ -2,7 +2,7 @@ import QuantCert.Quant
 
 namespace QuantCert
 
-def bitQ : QType := ⟨1, by decide, 1, by decide⟩
+def bitQ : QType := ⟨1, by decide, 1, by decide, true⟩
 
 /-- Products are wire bundles; unit is the empty bundle. Scales participate in typing. -/
 inductive WireType where
@@ -17,6 +17,9 @@ infixr:35 " ⊗ " => WireType.prod
   | .word q => BitVec q.bitWidth
   | .prod a b => Value a × Value b
 
+def wordInt (q : QType) (x : BitVec q.bitWidth) : Int :=
+  if q.signed then x.toInt else x.toNat
+
 /-- All primitives have a single output. Add requires identical quantization metadata. -/
 inductive Prim : WireType → QType → Type where
   | nand : Prim (.word bitQ ⊗ .word bitQ) bitQ
@@ -25,14 +28,23 @@ inductive Prim : WireType → QType → Type where
   | add (q : QType) : Prim (.word q ⊗ .word q) q
   | requant (a b : QType) (receipt : RequantParams a b) : Prim (.word a) b
   | relu (q : QType) : Prim (.word q) q
+  | const (q : QType) (value : Int) : Prim .unit q
+  | offset (a out : QType) (zeroPoint : Int) : Prim (.word a) out
+  | shift (q : QType) (amount : Nat) : Prim (.word q) q
+  | clip (a out : QType) (lo hi : Int) : Prim (.word a) out
 
 def evalPrim : Prim a q → Value a → BitVec q.bitWidth
   | .nand, (x, y) => BitVec.not (BitVec.and x y)
-  | .mul _ _ out _, (x, y) => BitVec.ofInt out.bitWidth (x.toInt * y.toInt)
-  | .add q, (x, y) => BitVec.ofInt q.bitWidth (x.toInt + y.toInt)
-  | .requant _ b r, x =>
-      BitVec.ofInt b.bitWidth (hwRequantizeInt x.toInt r.multiplier r.shift)
-  | .relu q, x => BitVec.ofInt q.bitWidth (max 0 x.toInt)
+  | .mul a b out _, (x, y) => BitVec.ofInt out.bitWidth (wordInt a x * wordInt b y)
+  | .add q, (x, y) => BitVec.ofInt q.bitWidth (wordInt q x + wordInt q y)
+  | .requant a b r, x =>
+      BitVec.ofInt b.bitWidth (hwRequantizeInt (wordInt a x) r.multiplier r.shift)
+  | .relu q, x => BitVec.ofInt q.bitWidth (max 0 (wordInt q x))
+  | .const q value, _ => BitVec.ofInt q.bitWidth value
+  | .offset a out zeroPoint, x =>
+      BitVec.ofInt out.bitWidth (wordInt a x - zeroPoint)
+  | .shift q amount, x => BitVec.ofInt q.bitWidth (wordInt q x / (2 ^ amount : Nat))
+  | .clip a out lo hi, x => BitVec.ofInt out.bitWidth (max lo (min hi (wordInt a x)))
 
 /-- Syntax of a free symmetric Cartesian monoidal hardware category.
 Categorical equations hold extensionally under `evalCircuit`, not as AST equality. -/
