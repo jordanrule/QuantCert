@@ -1,0 +1,15 @@
+read_verilog -sv build/quantized_layer.v scripts/reference.sv
+hierarchy -check
+proc
+check -assert
+equiv_make reference quantized_layer equiv
+hierarchy -top equiv
+flatten
+opt
+equiv_simple
+equiv_status -assert
+design -reset
+read_verilog -sv build/quantized_layer.v
+synth -top quantized_layer
+check -assert
+stat
