@@ -32,6 +32,10 @@ inductive Prim : WireType → QType → Type where
   | offset (a out : QType) (zeroPoint : Int) : Prim (.word a) out
   | shift (q : QType) (amount : Nat) : Prim (.word q) q
   | clip (a out : QType) (lo hi : Int) : Prim (.word a) out
+  /-- Read-only memory indexed by the raw (unsigned) address bits. The depth receipt
+  bounds the table by the address space; entries are stored modulo the data width. -/
+  | rom (a out : QType) (contents : List Int) (depth_ok : contents.length ≤ 2 ^ a.bitWidth) :
+      Prim (.word a) out
 
 def evalPrim : Prim a q → Value a → BitVec q.bitWidth
   | .nand, (x, y) => BitVec.not (BitVec.and x y)
@@ -45,6 +49,26 @@ def evalPrim : Prim a q → Value a → BitVec q.bitWidth
       BitVec.ofInt out.bitWidth (wordInt a x - zeroPoint)
   | .shift q amount, x => BitVec.ofInt q.bitWidth (wordInt q x / (2 ^ amount : Nat))
   | .clip a out lo hi, x => BitVec.ofInt out.bitWidth (max lo (min hi (wordInt a x)))
+  | .rom _ out contents _, x => BitVec.ofInt out.bitWidth (contents.getD x.toNat 0)
+
+/-- Addresses at or beyond the table depth (but inside the address space) read zero. -/
+theorem rom_read_in_range (a out : QType) (contents : List Int) (h : contents.length ≤ 2 ^ a.bitWidth)
+    (k : Nat) (hk : k < contents.length) :
+    evalPrim (.rom a out contents h) (BitVec.ofNat a.bitWidth k) =
+      BitVec.ofInt out.bitWidth contents[k] := by
+  have hk' : k < 2 ^ a.bitWidth := Nat.lt_of_lt_of_le hk h
+  simp [evalPrim, BitVec.toNat_ofNat, Nat.mod_eq_of_lt hk', List.getD_eq_getElem?_getD,
+    List.getElem?_eq_getElem hk]
+
+theorem rom_read_out_of_range (a out : QType) (contents : List Int)
+    (h : contents.length ≤ 2 ^ a.bitWidth) (x : BitVec a.bitWidth)
+    (hx : contents.length ≤ x.toNat) :
+    evalPrim (.rom a out contents h) x = 0 := by
+  simp [evalPrim, List.getD_eq_getElem?_getD, List.getElem?_eq_none hx]
+
+/-- Every table entry is representable in the data type, so a read returns it exactly. -/
+def RomFits (out : QType) (contents : List Int) : Prop :=
+  ∀ v ∈ contents, wordInt out (BitVec.ofInt out.bitWidth v) = v
 
 /-- Syntax of a free symmetric Cartesian monoidal hardware category.
 Categorical equations hold extensionally under `evalCircuit`, not as AST equality. -/

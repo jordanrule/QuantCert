@@ -26,10 +26,13 @@ bit patterns**, rather than a collection of test vectors:
 bash scripts/verify.sh
 ```
 
-This is a building block for tape-out assurance, **not tape-out sign-off**.
-It does not verify model accuracy, timing closure, clocks, reset, CDC, memories,
-power, physical design, DFT, or foundry rules. It is a combinational DSL, without
-cycle-level scheduling or register insertion.
+The proofs cover the **most critical aspects of functional assurance**: bit-exact
+arithmetic (widths, wrapping, rounding, signedness), quantization error bounds,
+compiler correctness, **pipelining that provably preserves behavior across clock
+cycles**, a defined synchronous reset, and ROM weight-table reads. These are the
+failure modes that simulation cannot exhaust and that are most expensive to find
+after silicon. This is **not tape-out sign-off**: see
+[What tape-out sign-off still requires](#what-tape-out-sign-off-still-requires).
 
 ## Typed Pipes with Mathematical Receipts
 
@@ -85,6 +88,39 @@ denotations**, not equalities of syntax trees. The checked laws include category
 identities/associativity, tensor interchange/identity, natural symmetry,
 associator inverses/naturality, pentagon, hexagon, triangle, unit inverses, and
 the Cartesian product and terminal-object equations.
+
+## Pipelining, reset and ROM
+
+`Pipe a b` (`QuantCert/Sequential.lean`) is a single-clock, single synchronous
+active-high reset layer over `Circuit`: `comb`, `reg init`, `seq`, `par`.
+`pipeline cut c` cuts any `Circuit` into stages, placing a register bank after each
+primitive selected by a `CutPolicy` (`cutEvery`, `cutHeavy` = multipliers,
+requantizers, ROMs), and pads shorter parallel branches with zero-reset delay
+registers so all paths have equal latency. Registers reset to zero.
+
+Two semantics are given and related: a stream denotation (`Pipe.sem`) and a clocked
+operational one (`Pipe.step`/`Pipe.run`, a Mealy machine with explicit register
+state and `rst`).
+
+| Receipt | What it establishes |
+|---|---|
+| `pipeline_realizes` | `pipeline cut c` computes `evalCircuit c` with exactly `latency` cycles of delay, for every circuit and policy. |
+| `Pipe.step_reset` | One reset edge puts every register at its reset value, whatever it held and whatever the inputs were. |
+| `pipeline_correct` | From **any** power-up register contents, with reset asserted on cycle 0 and released, from cycle `latency + 1` onward the clocked output equals the combinational circuit's output on the input from `latency` cycles earlier. |
+| `rom_read_in_range`, `rom_read_out_of_range`, `Examples.romMac_exact` | `Prim.rom` reads the table entry for in-range addresses and zero for addresses past the table; the weight-ROM MAC returns `weights[addr] * activation` exactly for all 4-bit addresses and INT8 activations. |
+| `Examples.pipelinedRomMac_correct`, `pipelinedLayer_correct` | The two instances of the above for the shipped designs (latency 2 each). |
+
+ROM addresses are the raw unsigned address bits; a `depth_ok` receipt bounds the table
+by `2^addressWidth`. Entries wrap to the data width unless `RomFits` is shown.
+Outputs during the first `latency` cycles after reset reflect reset values flowing
+through later stages and are intentionally **not** claimed to be meaningful;
+consumers must ignore them (or gate with a valid bit). Reset applied mid-stream is
+covered only for `step_reset`; `pipeline_correct` states the single-reset-at-start case.
+
+`toVerilogSeq` emits `clk`/`rst` ports, plain `always @(posedge clk)` registers with
+synchronous reset and no initial blocks, and ROMs as equality-chain `assign`s. As with
+`toVerilog`, the **printer is not proved**; Yosys checks stand in (below). Sequential
+netlist compilation has no analogue of `compile_correct`.
 
 ## Machine-checked properties
 
@@ -384,14 +420,22 @@ then synthesizes each generated module with `check -assert`. Adding a different
 model requires its own reference/equivalence check; the supplied RTL checks
 cover the emitted examples, not arbitrary future models.
 
+For sequential designs, `pipelined_rom_mac_check` (in `scripts/reference.sv`) wraps the
+emitted pipeline, a delayed copy of the combinational `rom_mac`, and a post-reset age
+counter; Yosys `sat -seq 4` proves they agree from an unconstrained power-up state once
+reset has been applied (a bounded check of the emitted RTL, not an unbounded proof). The
+`pipelined_layer` module is synthesized and structure-checked, but its two-multiplier
+SAT miter did not finish in practical time, so its cycle behavior rests on the Lean
+theorem `pipelinedLayer_correct` and the printer is unchecked for it.
+
 To rerun just the RTL check after emission:
 
 ```sh
 yosys -Q -T -l build/yosys.log scripts/verify.ys
 ```
 
-The checks are combinational: no assumptions,
-bounded cycle count, or stimulus file constrain the input space.
+The combinational checks use no assumptions, bounded cycle count, or stimulus file. The
+sequential check is bounded to four cycles from an arbitrary power-up state.
 
 Generated artifacts are ignored by Git:
 `build/designs.v`, `build/example-output.txt`, `build/axioms.txt`, and
@@ -407,6 +451,10 @@ rejects `sorryAx` and native-evaluation proof axioms.
 | `QuantCert/Compiler.lean` | Fresh-wire structural compilation, Verilog emission |
 | `QuantCert/Semantics.lean` | Operational netlist evaluation and compiler proof |
 | `QuantCert/Examples/QuantizedLayer.lean` | Quantized row demo and its end-to-end receipts |
+| `QuantCert/Sequential.lean` | `Pipe` (registers, reset), stream and clocked semantics, pipelining pass, refinement and reset theorems |
+| `QuantCert/SequentialRTL.lean` | Sequential netlist items and Verilog emitter with `clk`/`rst` |
+| `QuantCert/Examples/Pipelined.lean` | Weight-ROM MAC, pipelined ROM MAC and layer with correctness theorems |
+| `QuantCert/SequentialTests.lean` | ROM reads, latencies, simulation from scrambled power-up state |
 | `QuantCert/Tests.lean` | Signed extremes, rounding ties, gate and wiring regression checks |
 | `QuantCert/Model.lean` | Shape-typed rational and quantized affine/ReLU networks, signed/unsigned affine formats, parameter quantization |
 | `QuantCert/ModelRange.lean` | Executable interval propagation, width certificates, finite-width interpreter and exactness proof |
@@ -418,3 +466,30 @@ rejects `sorryAx` and native-evaluation proof axioms.
 | `Main.lean` | Single RTL emission entry point for all checked designs |
 | `scripts/Audit.lean` | Certificate axiom audit |
 | `scripts/reference.sv`, `scripts/verify.ys`, `scripts/verify.sh` | Independent RTL reference and reproducible Yosys verification |
+
+## What tape-out sign-off still requires
+
+QuantCert establishes *functional* intent at the arithmetic, RTL-semantics and
+single-clock-pipeline level. Sign-off additionally needs the following. They are not
+good targets for formalization here, because each depends on information outside the
+RTL semantics (a foundry PDK, extracted physical data, analog/statistical behavior, a
+vendor tool's proprietary model, or program-level process decisions) and verification
+there is empirical, tool-driven, and re-run on every netlist or ECO, not a one-time
+theorem.
+
+| Sign-off item | Why it is not a formalization task |
+|---|---|
+| **Model accuracy on real data** | Depends on the dataset and task distribution, not on circuit arithmetic. We bound error against a given reference model only. Evaluation on held-out data is statistical. |
+| **Timing closure** (STA, multi-corner/OCV) | Needs standard-cell libraries, parasitics and the placed/routed netlist; delays are numeric, process-dependent and change at every ECO. Latency in cycles is proved; nanoseconds are not. |
+| **Multiple clocks, CDC, metastability** | Synchronizer MTBF is a probabilistic, physical property. This tool has one clock domain by construction. |
+| **Reset in context** (async reset, release/removal timing, reset trees) | Recovery/removal is a timing property; the proof assumes the clean synchronous reset it defines. |
+| **Real memories** (SRAM macros, BIST/repair, ECC) | Behavior comes from compiler-generated macros and silicon defects. Only the abstract, bounded-address ROM table is modeled. |
+| **Power** (switching activity, IR drop, EM, thermal) | Analog/physical quantities driven by workloads and layout. |
+| **Physical design** (floorplan, placement, routing, LVS) | Layout-level tool output checked against vendor decks; equivalence of the final netlist is checked by logic-equivalence tools. |
+| **DFT** (scan, ATPG, test coverage) | Statistical fault-coverage metrics on the synthesized netlist; scan insertion changes the netlist. |
+| **Foundry rules** (DRC, antenna, density, ESD, reliability) | Geometric rules in proprietary decks; only the foundry's qualified checkers carry sign-off authority. |
+| **Verification of the toolchain** (Verilog printer, Yosys, synthesis) | A Lean proof covers the semantics here, not external tools; equivalence checking of the synthesized netlist against RTL is the pragmatic guard. |
+
+Practically, use QuantCert's receipts as inputs to that flow: proven widths and
+latencies feed the timing and floorplan constraints, and the generated RTL is the
+reference for formal equivalence checking of the synthesized netlist.

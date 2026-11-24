@@ -45,3 +45,37 @@ read_verilog -sv build/designs.v
 synth -top primitive_regressions
 check -assert
 stat
+design -reset
+read_verilog -sv build/designs.v scripts/reference.sv
+hierarchy -check
+proc
+memory_map
+check -assert
+equiv_make rom_reference rom_mac equiv
+hierarchy -top equiv
+flatten
+opt
+equiv_simple
+equiv_status -assert
+design -reset
+read_verilog -sv build/designs.v
+synth -top rom_mac
+check -assert
+stat
+design -reset
+read_verilog -sv build/designs.v
+synth -top pipelined_layer
+check -assert
+stat
+design -reset
+read_verilog -sv build/designs.v
+synth -top pipelined_rom_mac
+check -assert
+stat
+design -reset
+read_verilog -sv build/designs.v scripts/reference.sv
+hierarchy -check -top pipelined_rom_mac_check
+proc
+flatten
+opt_clean
+sat -verify -seq 4 -prove ok 1 -set-at 1 rst 1 -set-at 2 rst 0 -set-at 3 rst 0 -set-at 4 rst 0

@@ -54,3 +54,53 @@ module model_reference(
   wire signed [63:0] code2 = ((acc2 * 64'sd5 + 64'sd32) >>> 6) - 64'sd5;
   assign out0 = code2 < -128 ? -8'sd128 : (code2 > 127 ? 8'sd127 : code2[7:0]);
 endmodule
+
+// Independent ROM + multiply specification: a case table, zero beyond the 12 stored entries.
+module rom_reference(
+  input wire [3:0] w0,
+  input wire signed [7:0] w1,
+  output wire signed [31:0] out0
+);
+  reg signed [7:0] weight;
+  always @* begin
+    case (w0)
+      4'd0: weight = -8'sd128;
+      4'd1: weight = -8'sd100;
+      4'd2: weight = -8'sd64;
+      4'd3: weight = -8'sd32;
+      4'd4: weight = -8'sd1;
+      4'd5: weight = 8'sd0;
+      4'd6: weight = 8'sd1;
+      4'd7: weight = 8'sd7;
+      4'd8: weight = 8'sd42;
+      4'd9: weight = 8'sd77;
+      4'd10: weight = 8'sd120;
+      4'd11: weight = 8'sd127;
+      default: weight = 8'sd0;
+    endcase
+  end
+  assign out0 = weight * w1;
+endmodule
+
+// Sequential refinement checks. `ok` must hold on every cycle of a run that asserts `rst`
+// on its first cycle and then releases it, from an arbitrary power-up register state.
+// Outputs are compared with the combinational design on the input from `LATENCY` cycles
+// earlier, starting `LATENCY` cycles after reset is released (`age` counts those cycles).
+module pipelined_rom_mac_check(
+  input wire clk, rst,
+  input wire [3:0] w0,
+  input wire signed [7:0] w1,
+  output wire ok
+);
+  wire signed [31:0] got, want;
+  reg [11:0] h1, h2;
+  reg [2:0] age;
+  pipelined_rom_mac dut(.clk(clk), .rst(rst), .w0(w0), .w1(w1), .out0(got));
+  rom_mac comb(.w0(h2[11:8]), .w1(h2[7:0]), .out0(want));
+  always @(posedge clk) begin
+    h1 <= {w0, w1};
+    h2 <= h1;
+    age <= rst ? 3'd0 : (age == 3'd7 ? 3'd7 : age + 3'd1);
+  end
+  assign ok = rst | (age < 3'd2) | (got == want);
+endmodule

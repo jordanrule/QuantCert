@@ -126,6 +126,12 @@ def primRTL {a : WireType} {q : QType} (op : Prim a q) (inputs : WireEnv a)
   | .shift q amount, x =>
       let cast := if q.signed then "$signed" else "$unsigned"
       [decl, s!"  assign {dst} = {cast}({wireName x}) >>> {amount};"]
+  | .rom a out contents _, x =>
+      -- A priority-free equality chain: synthesizable, no initial blocks, unmatched reads are 0.
+      let addr := s!"$unsigned({wireName x})"
+      let entries := contents.zipIdx.map fun (v, k) =>
+        s!"{addr} == {a.bitWidth}'d{k} ? {out.bitWidth}'d{(BitVec.ofInt out.bitWidth v).toNat} : "
+      [decl, s!"  assign {dst} = " ++ String.join entries ++ s!"{out.bitWidth}'d0;"]
   | .clip a _ lo hi, x =>
       let w := max (a.bitWidth + 1) (max lo.natAbs.log2 hi.natAbs.log2 + 2)
       let src := extend a w x
